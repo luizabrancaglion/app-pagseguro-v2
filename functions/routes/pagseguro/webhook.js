@@ -1,6 +1,16 @@
 const parseChargeStatus = require('../../lib/pagseguro/parse-status')
 const { logger } = require('../../context')
 
+// statuses the platform mirrors on order.financial_status, so a matching
+// financial status is enough to treat the payments history as already updated
+const ORDER_LEVEL_STATUS = ['paid', 'voided', 'refunded']
+// statuses of a charge that died without ever being paid (card declined, PIX/boleto expired)
+const UNPAID_DEAD_STATUS = ['unauthorized', 'voided']
+// statuses that prove money never moved on a transaction or order; anything
+// else (paid, partially_paid, in_dispute, refunded, partially_refunded...)
+// means the merchant may already have shipped and cancellation is theirs to make
+const NEVER_PAID_STATUS = ['pending', 'under_analysis', 'unauthorized', 'voided']
+
 exports.post = async ({ appSdk }, req, res) => {
   const payload = req.body
 
@@ -67,7 +77,8 @@ exports.post = async ({ appSdk }, req, res) => {
  * @throws {Error} with name='NotFound' if order not found
  */
 const updateOrderPaymentStatus = async (appSdk, storeId, chargeId, ecomStatus, orderId) => {
-  const fields = '_id,status,financial_status,transactions._id,transactions.status,transactions.intermediator'
+  const fields = '_id,status,financial_status,fulfillment_status,' +
+    'transactions._id,transactions.status,transactions.intermediator'
 
   let orders
   const result = await appSdk.apiRequest(
@@ -117,7 +128,7 @@ const updateOrderPaymentStatus = async (appSdk, storeId, chargeId, ecomStatus, o
 
   if (currentStatus === ecomStatus) {
     logger.info(`PagBank webhook: status already ${ecomStatus}, skipping`, { storeId, chargeId })
-  } else if (financialStatus === ecomStatus && ['paid', 'voided', 'refunded'].includes(ecomStatus)) {
+  } else if (financialStatus === ecomStatus && ORDER_LEVEL_STATUS.includes(ecomStatus)) {
     logger.info(`PagBank webhook: financial status already ${ecomStatus}, skipping`, { storeId, chargeId })
   } else {
     // post payment history update
@@ -140,31 +151,73 @@ const updateOrderPaymentStatus = async (appSdk, storeId, chargeId, ecomStatus, o
   // a charge declined or cancelled before ever being paid leaves the order open
   // with its items still holding stock; the platform only gives the quantities
   // back when the order itself is cancelled
-  const wasPaid = PAID_STATUS.includes(currentStatus) || PAID_STATUS.includes(financialStatus)
-  if (UNPAID_DEAD_STATUS.includes(ecomStatus) && !wasPaid) {
-    await cancelUnpaidOrder(appSdk, storeId, order, chargeId)
+  if (UNPAID_DEAD_STATUS.includes(ecomStatus)) {
+    const skipReason = getCancelSkipReason(order, matchTransaction, currentStatus, financialStatus)
+    if (skipReason) {
+      logger.info(`PagBank webhook: not cancelling order ${order._id}, ${skipReason}`, { storeId, chargeId })
+    } else {
+      await cancelUnpaidOrder(appSdk, storeId, order, chargeId)
+    }
   }
 }
 
-// statuses of a charge that died without ever being paid (card declined, PIX/boleto expired)
-const UNPAID_DEAD_STATUS = ['unauthorized', 'voided']
-const PAID_STATUS = ['paid', 'partially_paid']
+const isNeverPaid = status => !status || NEVER_PAID_STATUS.includes(status)
+
+/**
+ * Decide whether the order can be cancelled on the app's own authority.
+ * Returns a reason string to skip, or null when the order never held a payment,
+ * has no other transaction still alive and nothing has left the warehouse.
+ */
+const getCancelSkipReason = (order, matchTransaction, currentStatus, financialStatus) => {
+  if (order.status !== 'open') {
+    return `order is ${order.status}`
+  }
+  if (!isNeverPaid(currentStatus) || !isNeverPaid(financialStatus)) {
+    return `payment status is ${currentStatus} / ${financialStatus}`
+  }
+  const fulfillmentStatus = order.fulfillment_status && order.fulfillment_status.current
+  if (fulfillmentStatus && fulfillmentStatus !== 'unfulfilled') {
+    return `fulfillment status is ${fulfillmentStatus}`
+  }
+  // customer may have retried with another payment on the same order
+  const otherTransactionAlive = order.transactions.some(t => {
+    if (t === matchTransaction) return false
+    const status = t.status && t.status.current
+    return !UNPAID_DEAD_STATUS.includes(status)
+  })
+  if (otherTransactionAlive) {
+    return 'another transaction is still alive'
+  }
+  return null
+}
 
 /**
  * Cancel the E-Com Plus order so the platform returns the reserved stock.
- * Errors propagate: the handler answers 500 and a redelivered notification
- * retries only this step, since the payments history above is idempotent.
+ * A 4xx from Store API is final (the same PATCH would fail again), so it is
+ * only logged; other errors propagate, the handler answers 500 and the
+ * redelivered notification retries only this step, since the payments
+ * history above is idempotent.
  */
 const cancelUnpaidOrder = async (appSdk, storeId, order, chargeId) => {
-  if (order.status === 'cancelled') {
-    return
+  try {
+    await appSdk.apiRequest(
+      storeId,
+      `orders/${order._id}.json`,
+      'PATCH',
+      { status: 'cancelled' }
+    )
+  } catch (err) {
+    const status = err.response && err.response.status
+    if (status >= 400 && status < 500) {
+      logger.error(`PagBank webhook: Store API refused cancelling order ${order._id}`, {
+        storeId,
+        chargeId,
+        status,
+        err: err.message
+      })
+      return
+    }
+    throw err
   }
-
-  await appSdk.apiRequest(
-    storeId,
-    `orders/${order._id}.json`,
-    'PATCH',
-    { status: 'cancelled' }
-  )
   logger.info(`PagBank webhook: order ${order._id} cancelled, stock returned`, { storeId, chargeId })
 }

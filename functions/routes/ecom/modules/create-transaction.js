@@ -58,11 +58,11 @@ exports.post = async ({ appSdk, admin }, req, res) => {
 
     switch (methodCode) {
       case 'credit_card': {
-        // extract encrypted card hash (may come as "ENCRYPTED // BRAND cardnumber")
+        // extract encrypted card hash, may come as
+        // "ENCRYPTED // BRAND last4 // 3DS id AUTHENTICATED" (see hosting/pagseguro-dp.js)
         const rawHash = params.credit_card && params.credit_card.hash
-        const encryptedCard = rawHash && rawHash.includes(' // ')
-          ? rawHash.split(' // ')[0]
-          : rawHash
+        const hashParts = rawHash ? String(rawHash).split(' // ') : []
+        const encryptedCard = hashParts[0]
 
         if (!encryptedCard) {
           return res.status(400).send({
@@ -74,6 +74,19 @@ exports.post = async ({ appSdk, admin }, req, res) => {
         const antifraud = config.antifraud || {}
         attempt = buildAttemptContext(params)
         velocityKeys = buildVelocityKeys(attempt)
+
+        // 3DS result reported by the client script; strict mode is enforced here,
+        // so a request skipping the browser flow cannot bypass it
+        const threedsMode = (config.credit_card && config.credit_card.threeds) || 'disabled'
+        const threeds = parseThreedsPart(hashParts.find(part => part.startsWith('3DS ')))
+        attempt.threeds = { mode: threedsMode, ...threeds }
+        if (threedsMode === 'strict' && (!threeds.id || threeds.status !== 'AUTHENTICATED')) {
+          await saveAttempt('rejected', { reason: 'THREEDS_REQUIRED' })
+          return res.status(400).send({
+            error: 'THREEDS_REQUIRED',
+            message: 'Transação não autenticada pelo emissor do cartão (3DS obrigatório)'
+          })
+        }
 
         // reject invalid CPF/CNPJ before reaching PagBank
         if (antifraud.validate_tax_id !== false && !validateTaxId(attempt.tax_id)) {
@@ -132,6 +145,13 @@ exports.post = async ({ appSdk, admin }, req, res) => {
           charge.payment_method.card.holder = {
             name: String(holderName).substr(0, 30),
             tax_id: String(buyer.doc_number || buyer.registry_number || '').replace(/\D/g, '')
+          }
+        }
+
+        if (threeds.id) {
+          charge.payment_method.authentication_method = {
+            type: 'THREEDS',
+            id: threeds.id
           }
         }
 
@@ -428,5 +448,23 @@ exports.post = async ({ appSdk, admin }, req, res) => {
       error: 'CREATE_TRANSACTION_ERR',
       message: err.message
     })
+  }
+}
+
+/**
+ * Parses the 3DS segment appended to the card hash by the client script:
+ * "3DS <id|-> <AUTHENTICATED|NOT_AUTHENTICATED|SKIPPED|...> [reason]"
+ * @param {string} [part]
+ * @returns {{ id: string|null, status: string|null, reason: string|null }}
+ */
+const parseThreedsPart = (part) => {
+  if (!part) {
+    return { id: null, status: null, reason: null }
+  }
+  const [, id, status, ...reason] = part.split(' ')
+  return {
+    id: id && id.startsWith('3DS_') ? id : null,
+    status: status || null,
+    reason: reason.length ? reason.join(' ').substr(0, 120) : null
   }
 }

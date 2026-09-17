@@ -96,6 +96,17 @@
             "minimum": 0,
             "title": "Valor mínimo para cartão",
             "description": "Valor mínimo do pedido para habilitar pagamento com cartão"
+          },
+          "threeds": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "permissive",
+              "strict"
+            ],
+            "default": "disabled",
+            "title": "Autenticação 3DS",
+            "description": "disabled: sem 3DS; permissive: autentica quando o cartão suporta e segue sem 3DS quando não suporta; strict: só aceita transação autenticada pelo emissor (barra bots que não passam pelo navegador, mas recusa cartões fora do 3DS)"
           }
         },
         "title": "Cartão de crédito"

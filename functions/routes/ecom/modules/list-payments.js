@@ -22,7 +22,7 @@ exports.post = async ({ appSdk, admin }, req, res) => {
   const isSandbox = config.sandbox === true
   const pagbank = createPagbankAxios(pagbankToken, isSandbox)
   const scriptSuffix = isSandbox ? '-sandbox' : ''
-  const scriptUri = `${hostingUri}/pagseguro-dp${scriptSuffix}.js?v=2`
+  const scriptUri = `${hostingUri}/pagseguro-dp${scriptSuffix}.js?v=3`
 
   // https://apx-mods.e-com.plus/api/v1/list_payments/response_schema.json?store_id=100
   const response = {
@@ -62,6 +62,36 @@ exports.post = async ({ appSdk, admin }, req, res) => {
     const ccConfig = config.credit_card || {}
     const ccLabel = ccConfig.label || 'Cartão de crédito'
 
+    let onloadExpression = publicKey
+      ? `window.pagbankPublicKey=${JSON.stringify(publicKey)};`
+      : ''
+
+    // 3DS: session is created here (valid for 30 min) and consumed by the client script;
+    // the storefront re-runs list_payments when the gateway is selected, refreshing it
+    const threedsMode = ccConfig.threeds || 'disabled'
+    if (threedsMode !== 'disabled') {
+      const threeds = {
+        mode: threedsMode,
+        env: isSandbox ? 'SANDBOX' : 'PROD',
+        session: null,
+        expires_at: null
+      }
+      try {
+        const { data } = await pagbank.post('/checkout-sdk/sessions')
+        threeds.session = data.session
+        threeds.expires_at = data.expires_at || null
+      } catch (err) {
+        logger.warn('PagBank: could not create 3DS session', {
+          storeId,
+          status: err.response && err.response.status,
+          err: err.message
+        })
+      }
+      onloadExpression += `window.pagbankThreeds=${JSON.stringify(threeds)};`
+    } else {
+      onloadExpression += 'window.pagbankThreeds=null;'
+    }
+
     const gateway = {
       ...newGateway(),
       label: ccLabel,
@@ -71,9 +101,7 @@ exports.post = async ({ appSdk, admin }, req, res) => {
       },
       js_client: {
         script_uri: scriptUri,
-        onload_expression: publicKey
-          ? `window.pagbankPublicKey=${JSON.stringify(publicKey)};`
-          : '',
+        onload_expression: onloadExpression,
         cc_brand: {
           function: 'pagbankGetBrand',
           is_promise: false

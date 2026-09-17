@@ -3,6 +3,15 @@ const buildOrderPayload = require('../../../lib/pagseguro/build-order-payload')
 const { parseBoletoAddress } = require('../../../lib/pagseguro/build-order-payload')
 const parseChargeStatus = require('../../../lib/pagseguro/parse-status')
 const { getConnectToken } = require('../../../lib/pagseguro/connect-token')
+const validateTaxId = require('../../../lib/fraud/validate-tax-id')
+const {
+  buildAttemptContext,
+  buildVelocityKeys,
+  checkVelocity,
+  recordAttempt,
+  outcomeFromChargeStatus,
+  parseChargeDetails
+} = require('../../../lib/fraud/card-attempts')
 const { baseUri } = require('../../../__env')
 const { logger } = require('../../../context')
 
@@ -35,6 +44,14 @@ exports.post = async ({ appSdk, admin }, req, res) => {
   // embed storeId in notification URL so webhook knows which store this charge belongs to
   basePayload.notification_urls = [`${baseUri}/pagseguro/webhook?store_id=${storeId}`]
 
+  // credit card attempt context (who/where) for forensics and velocity checks
+  let attempt = null
+  let velocityKeys = []
+  const saveAttempt = (outcome, details) => {
+    if (!attempt) return Promise.resolve()
+    return recordAttempt(admin.firestore(), storeId, { ...attempt, outcome, ...details }, velocityKeys)
+  }
+
   try {
     let responseData
     let ecomTransaction
@@ -52,6 +69,42 @@ exports.post = async ({ appSdk, admin }, req, res) => {
             error: 'MISSING_CARD_HASH',
             message: 'Hash do cartão criptografado não encontrado'
           })
+        }
+
+        const antifraud = config.antifraud || {}
+        attempt = buildAttemptContext(params)
+        velocityKeys = buildVelocityKeys(attempt)
+
+        // reject invalid CPF/CNPJ before reaching PagBank
+        if (antifraud.validate_tax_id !== false && !validateTaxId(attempt.tax_id)) {
+          await saveAttempt('rejected', { reason: 'INVALID_TAX_ID' })
+          return res.status(400).send({
+            error: 'INVALID_TAX_ID',
+            message: 'CPF/CNPJ inválido'
+          })
+        }
+
+        // velocity: too many attempts or declines for the same IP / tax ID / e-mail
+        const velocityConfig = antifraud.velocity || {}
+        const velocityMode = velocityConfig.mode || 'off'
+        if (velocityMode !== 'off') {
+          const velocity = await checkVelocity(admin.firestore(), storeId, velocityKeys, velocityConfig)
+          attempt.velocity = { mode: velocityMode, ...velocity }
+          if (velocity.flagged) {
+            logger.warn(`Card velocity flagged for order #${orderNumber} (mode: ${velocityMode})`, {
+              storeId,
+              orderNumber,
+              reasons: velocity.reasons,
+              counts: velocity.counts
+            })
+            if (velocityMode === 'block') {
+              await saveAttempt('blocked', { reason: 'VELOCITY' })
+              return res.status(403).send({
+                error: 'VELOCITY_LIMIT',
+                message: 'Limite de tentativas de pagamento excedido, tente novamente mais tarde'
+              })
+            }
+          }
         }
 
         const installmentsNumber = params.installments_number || 1
@@ -91,6 +144,11 @@ exports.post = async ({ appSdk, admin }, req, res) => {
         const responseCharge = data.charges && data.charges[0]
         const chargeId = responseCharge && responseCharge.id
         const chargeStatus = responseCharge && responseCharge.status
+
+        await saveAttempt(outcomeFromChargeStatus(chargeStatus), {
+          ...parseChargeDetails(responseCharge),
+          pagbank_order_id: data.id || null
+        })
 
         // installment value calculation
         const installmentValue = Math.round(chargeAmount / installmentsNumber) / 100
@@ -330,6 +388,13 @@ exports.post = async ({ appSdk, admin }, req, res) => {
   } catch (err) {
     const errResponse = err.response && err.response.data
     const status = err.response && err.response.status
+
+    await saveAttempt('error', {
+      reason: status ? `HTTP_${status}` : err.message,
+      pagbank: errResponse
+        ? { error_messages: errResponse.error_messages || errResponse.message || null }
+        : null
+    })
 
     logger.error('PagBank create transaction error', {
       storeId,

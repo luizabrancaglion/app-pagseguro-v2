@@ -267,6 +267,75 @@ const app = {
         title: 'Desconto'
       },
       hide: false
+    },
+    antifraud: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          validate_tax_id: {
+            type: 'boolean',
+            default: true,
+            title: 'Validar CPF/CNPJ',
+            description: 'Recusa pagamento com cartão quando o dígito verificador do CPF/CNPJ do comprador é inválido'
+          },
+          velocity: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              mode: {
+                type: 'string',
+                enum: ['off', 'observe', 'block'],
+                default: 'off',
+                title: 'Limite de tentativas com cartão',
+                description: 'off: desligado; observe: apenas registra quem ultrapassou o limite, sem bloquear; block: recusa o pagamento. Comece em "observe" por alguns dias antes de bloquear.'
+              },
+              window_minutes: {
+                type: 'integer',
+                minimum: 5,
+                maximum: 1440,
+                default: 60,
+                title: 'Janela de contagem (minutos)'
+              },
+              max_attempts: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 100,
+                default: 5,
+                title: 'Máximo de tentativas na janela',
+                description: 'Tentativas do mesmo IP, CPF/CNPJ, e-mail ou cartão'
+              },
+              max_declined: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 100,
+                default: 3,
+                title: 'Máximo de recusas na janela',
+                description: 'Cartões recusados pelo PagBank para o mesmo IP, CPF/CNPJ, e-mail ou cartão'
+              },
+              address_window_minutes: {
+                type: 'integer',
+                minimum: 30,
+                maximum: 4320,
+                default: 360,
+                title: 'Janela do endereço (minutos)',
+                description: 'Período considerado para contar compradores diferentes no mesmo endereço'
+              },
+              max_identities_per_address: {
+                type: 'integer',
+                minimum: 2,
+                maximum: 50,
+                default: 3,
+                title: 'Máximo de compradores por endereço',
+                description: 'Quantos CPF/CNPJ diferentes podem comprar para o mesmo CEP e número na janela. É o sinal que distingue teste de cartão de uma casa movimentada — aumente se a loja vende para condomínios, empresas ou redespacho.'
+              }
+            },
+            title: 'Limite de tentativas'
+          }
+        },
+        title: 'Antifraude (cartão de crédito)'
+      },
+      hide: false
     }
   }
 }

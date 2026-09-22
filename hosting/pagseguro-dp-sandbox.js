@@ -39,7 +39,8 @@
   /**
    * Encrypts card data using PagBank SDK.
    * Called by cc_hash js_client config.
-   * @param {object} card - { number, holder, month, year, cvv }
+   * @param {object} card - { number, name, month, year, cvc } as sent by the
+   *   storefront CreditCardForm; `cvv`/`security_code` accepted as fallbacks
    * @returns {Promise<string>} encrypted card string
    */
   window.pagbankEncryptCard = function (card) {
@@ -66,7 +67,7 @@
             number: String(card.number || '').replace(/\D/g, ''),
             expMonth,
             expYear,
-            securityCode: String(card.cvv || card.security_code || '')
+            securityCode: String(card.cvc || card.cvv || card.security_code || '')
           })
 
           if (result.hasErrors) {

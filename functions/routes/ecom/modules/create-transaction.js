@@ -78,6 +78,16 @@ exports.post = async ({ appSdk, admin }, req, res) => {
           })
         }
 
+        // a strict store cannot approve a charge without authentication, so stop
+        // before touching PagBank: pre-authorizing just to cancel would hold the
+        // cardholder's limit and turn this endpoint into a card-validity oracle
+        if (threedsMode === 'strict' && !useThreeds) {
+          return res.status(400).send({
+            error: 'THREEDS_REQUIRED',
+            message: 'Não foi possível autenticar o cartão junto ao emissor, utilize outro cartão ou forma de pagamento'
+          })
+        }
+
         const charge = {
           reference_id: String(orderNumber).substr(0, 64),
           description: `Pedido #${orderNumber}`.substr(0, 64),
@@ -151,10 +161,13 @@ exports.post = async ({ appSdk, admin }, req, res) => {
           logger.info(`PagBank: charge ${chargeId} authentication ${authentication.status}`, { storeId, orderNumber })
         }
 
-        if (threedsMode === 'strict') {
+        // a plain decline is not an authentication problem: report it like any
+        // other store does, so the order keeps its unauthorized transaction
+        // instead of a misleading 3DS error
+        if (threedsMode === 'strict' && chargeStatus !== 'DECLINED') {
           // the charge was only pre-authorized; capture it or let it go
           if (!authentication.authenticated || !chargeId) {
-            if (chargeId && chargeStatus !== 'DECLINED') {
+            if (chargeId) {
               await cancelCharge(pagbank, chargeId, chargeAmount, storeId)
             }
             return res.status(400).send({

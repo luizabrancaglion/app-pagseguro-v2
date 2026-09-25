@@ -84,6 +84,13 @@ const app = {
             minimum: 0,
             title: 'Valor mínimo para cartão',
             description: 'Valor mínimo do pedido para habilitar pagamento com cartão'
+          },
+          threeds: {
+            type: 'string',
+            enum: ['disabled', 'permissive', 'strict'],
+            default: 'disabled',
+            title: 'Autenticação 3DS',
+            description: 'disabled: sem 3DS. permissive: autentica quando o cartão permite e segue normalmente quando não permite. strict: só conclui a venda se o PagBank confirmar a autenticação do emissor — transfere o risco de fraude para o emissor, mas recusa cartão fora do 3DS.'
           }
         },
         title: 'Cartão de crédito'

@@ -4,6 +4,12 @@
  * PagBank Direct Payment — client-side integration script.
  * Loaded by the storefront checkout via list-payments js_client.
  * Defines window.pagbankEncryptCard and window.pagbankGetBrand.
+ *
+ * Globals set by list-payments onload_expression:
+ * - window.pagbankPublicKey: public key for card encryption
+ * - window.pagbankThreeds: { mode, env, session, expires_at } or null
+ * Globals set by the storefront before running the onload_expression:
+ * - window._checkout: { amount, customer, items }
  */
 ;(function () {
   const sdkUrl = 'https://assets.pagseguro.com.br/checkout-sdk-js/rc/dist/browser/pagseguro.min.js'
@@ -36,70 +42,216 @@
     return ''
   }
 
+  let sdkPromise = null
+  const loadSdk = function () {
+    if (typeof PagSeguro !== 'undefined') {
+      return Promise.resolve()
+    }
+    if (!sdkPromise) {
+      sdkPromise = new Promise(function (resolve, reject) {
+        const script = document.createElement('script')
+        script.src = sdkUrl
+        script.onload = resolve
+        script.onerror = function () {
+          sdkPromise = null
+          reject(new Error('Failed to load PagBank SDK'))
+        }
+        document.head.appendChild(script)
+      })
+    }
+    return sdkPromise
+  }
+
   /**
-   * Encrypts card data using PagBank SDK.
+   * Normalizes the card fields the storefront CreditCardForm sends:
+   * { name, doc, number, cvc, month, year, brand }.
+   */
+  const parseCard = function (card) {
+    let expYear = String(card.year || card.exp_year || '')
+    if (expYear.length === 2) {
+      expYear = '20' + expYear
+    }
+    return {
+      number: String(card.number || '').replace(/\D/g, ''),
+      holder: card.holder || card.holder_name || card.name || '',
+      expMonth: String(card.month || card.exp_month || '').padStart(2, '0'),
+      expYear: expYear,
+      securityCode: String(card.cvc || card.cvv || card.security_code || '')
+    }
+  }
+
+  /**
+   * The exact amount and installments this checkout will charge. PagBank refuses
+   * the authentication id when they differ from the charge (400
+   * INVALID AUTHENTICATION_METHOD.ID), so both are read at submit time and
+   * travel back to the server inside the hash for it to compare.
+   * @returns {{ amount: number, installments: number }} amount in cents
+   */
+  const chargeContext = function () {
+    const checkout = window._checkout || window.storefrontApp || {}
+    const amount = checkout.amount || {}
+    const total = typeof amount.total === 'number' ? amount.total : 0
+    const select = document.getElementById('credit-card-installment')
+    const parsed = select ? parseInt(select.value, 10) : 1
+    return {
+      amount: Math.round(total * 100),
+      installments: parsed > 1 ? parsed : 1
+    }
+  }
+
+  const userError = function (code, userMsg) {
+    const err = new Error(code)
+    err.code = code
+    err.userMsg = userMsg
+    return err
+  }
+
+  /**
+   * Runs PagBank 3DS when the store enabled it.
+   * Resolves with { id, amount, installments } or { skipped: reason }.
+   *
+   * The SDK's own `authenticationStatus` is deliberately ignored: PagBank has
+   * answered `authentication_method.status = AUTHENTICATED` for flows where the
+   * SDK reported NOT_AUTHENTICATED, so refusing here would reject good
+   * customers. Only the charge response decides, on the server.
+   */
+  const authenticateThreeds = function (card, context) {
+    const config = window.pagbankThreeds
+    if (!config || !config.mode || config.mode === 'disabled' || !config.session) {
+      return Promise.resolve(null)
+    }
+    // expires_at comes from PagBank in MILLISECONDS
+    if (config.expires_at && Date.now() > Number(config.expires_at)) {
+      return Promise.resolve({ skipped: 'SESSION_EXPIRED' })
+    }
+    if (context.amount < 100) {
+      return Promise.resolve({ skipped: 'AMOUNT_TOO_LOW' })
+    }
+
+    try {
+      PagSeguro.setUp({ session: config.session, env: config.env || 'PROD' })
+    } catch (err) {
+      console.warn('[PagBank] 3DS setUp failed', err)
+      return Promise.resolve({ skipped: 'SETUP_ERROR' })
+    }
+
+    const checkout = window._checkout || window.storefrontApp || {}
+    const customer = checkout.customer || {}
+    const data = {
+      customer: {
+        name: String(card.holder || customer.display_name || '').substr(0, 100),
+        email: String(customer.main_email || '').substr(0, 60)
+      },
+      paymentMethod: {
+        type: 'CREDIT_CARD',
+        installments: context.installments,
+        card: {
+          number: card.number,
+          expMonth: card.expMonth,
+          expYear: card.expYear,
+          holder: { name: String(card.holder || '').substr(0, 30) }
+        }
+      },
+      amount: { value: context.amount, currency: 'BRL' },
+      dataOnly: false
+    }
+
+    const phone = customer.phones && customer.phones[0]
+    const phoneNumber = phone && String(phone.number || '').replace(/\D/g, '')
+    if (phoneNumber && phoneNumber.length >= 10) {
+      data.customer.phones = [{
+        country: '55',
+        area: phoneNumber.substr(0, 2),
+        number: phoneNumber.substr(2),
+        type: 'MOBILE'
+      }]
+    }
+
+    const addresses = customer.addresses || []
+    const address = addresses.filter(function (a) { return a.default })[0] || addresses[0]
+    if (address && address.zip) {
+      const parsed = {
+        street: String(address.street || '').substr(0, 100),
+        number: String(address.number || 'SN').substr(0, 20),
+        city: String(address.city || '').substr(0, 90),
+        regionCode: String(address.province_code || '').substr(0, 2).toUpperCase(),
+        country: 'BRA',
+        postalCode: String(address.zip || '').replace(/\D/g, '').substr(0, 8)
+      }
+      if (address.complement) {
+        parsed.complement = String(address.complement).substr(0, 40)
+      }
+      data.billingAddress = parsed
+      data.shippingAddress = parsed
+    }
+
+    return PagSeguro.authenticate3DS({ data: data }).then(function (result) {
+      const status = result && result.status
+      if (status === 'CHANGE_PAYMENT_METHOD') {
+        throw userError('CHANGE_PAYMENT_METHOD',
+          ' A autenticação foi negada pelo emissor do cartão, utilize outro cartão ou forma de pagamento.')
+      }
+      if (result && result.id) {
+        return { id: result.id, amount: context.amount, installments: context.installments }
+      }
+      // AUTH_NOT_SUPPORTED, an unfinished REQUIRE_* state, or anything new
+      return { skipped: status || 'NO_ID' }
+    }, function (err) {
+      if (err && err.code === 'CHANGE_PAYMENT_METHOD') {
+        throw err
+      }
+      console.warn('[PagBank] 3DS error', err && (err.detail || err.message))
+      return { skipped: 'SDK_ERROR' }
+    })
+  }
+
+  /**
+   * Encrypts card data using the PagBank SDK, running 3DS first when enabled.
    * Called by cc_hash js_client config.
-   * @param {object} card - { number, holder, month, year, cvv }
-   * @returns {Promise<string>} encrypted card string
+   * @param {object} card - { number, name, month, year, cvc } from the storefront
+   * @returns {Promise<string>} "ENCRYPTED // brand last4 [// 3DS <id> <amount> <installments>]"
    */
   window.pagbankEncryptCard = function (card) {
-    return new Promise(function (resolve, reject) {
-      const encrypt = function () {
-        const publicKey = window.pagbankPublicKey
-        if (!publicKey) {
-          return reject(new Error('PagBank public key not loaded'))
+    const publicKey = window.pagbankPublicKey
+    if (!publicKey) {
+      return Promise.reject(new Error('PagBank public key not loaded'))
+    }
+    const parsed = parseCard(card)
+    const context = chargeContext()
+
+    return loadSdk()
+      .then(function () {
+        return authenticateThreeds(parsed, context)
+      })
+      .then(function (threeds) {
+        const result = PagSeguro.encryptCard({
+          publicKey: publicKey,
+          holder: parsed.holder,
+          number: parsed.number,
+          expMonth: parsed.expMonth,
+          expYear: parsed.expYear,
+          securityCode: parsed.securityCode
+        })
+
+        if (result.hasErrors) {
+          const messages = result.errors
+            ? result.errors.map(function (e) { return e.message || e.code }).join('; ')
+            : 'Card encryption failed'
+          throw new Error(messages)
         }
 
-        // normalize year to 4 digits
-        let expYear = String(card.year || card.exp_year || '')
-        if (expYear.length === 2) {
-          expYear = '20' + expYear
+        // brand and 3DS data are appended to the hash and stripped server-side
+        const brand = window.pagbankGetBrand(card)
+        let encrypted = result.encryptedCard
+        if (brand) {
+          encrypted += ' // ' + brand + ' ' + parsed.number.slice(-4)
         }
-
-        const expMonth = String(card.month || card.exp_month || '').padStart(2, '0')
-
-        try {
-          const result = PagSeguro.encryptCard({
-            publicKey,
-            holder: card.holder || card.holder_name || card.name || '',
-            number: String(card.number || '').replace(/\D/g, ''),
-            expMonth,
-            expYear,
-            securityCode: String(card.cvv || card.security_code || '')
-          })
-
-          if (result.hasErrors) {
-            const messages = result.errors
-              ? result.errors.map(function (e) { return e.message || e.code }).join('; ')
-              : 'Card encryption failed'
-            return reject(new Error(messages))
-          }
-
-          // append brand info for debugging (stripped server-side)
-          const brand = window.pagbankGetBrand(card)
-          const encrypted = result.encryptedCard +
-            (brand ? ` // ${brand} ${String(card.number || '').replace(/\D/g, '').slice(-4)}` : '')
-
-          resolve(encrypted)
-        } catch (err) {
-          reject(err)
+        if (threeds && threeds.id) {
+          encrypted += ' // 3DS ' + threeds.id + ' ' + threeds.amount + ' ' + threeds.installments
+        } else if (threeds && threeds.skipped) {
+          console.warn('[PagBank] 3DS skipped:', threeds.skipped)
         }
-      }
-
-      // load PagBank SDK if not already loaded
-      if (typeof PagSeguro !== 'undefined') {
-        return encrypt()
-      }
-
-      const script = document.createElement('script')
-      script.src = sdkUrl
-      script.onload = function () {
-        encrypt()
-      }
-      script.onerror = function () {
-        reject(new Error('Failed to load PagBank SDK'))
-      }
-      document.head.appendChild(script)
-    })
+        return encrypted
+      })
   }
 })()

@@ -3,6 +3,14 @@ const buildOrderPayload = require('../../../lib/pagseguro/build-order-payload')
 const { parseBoletoAddress } = require('../../../lib/pagseguro/build-order-payload')
 const parseChargeStatus = require('../../../lib/pagseguro/parse-status')
 const { getConnectToken } = require('../../../lib/pagseguro/connect-token')
+const {
+  parseCardHash,
+  matchesCharge,
+  captureCharge,
+  parseChargeAuthentication,
+  isInvalidAuthenticationId,
+  cancelCharge
+} = require('../../../lib/pagseguro/threeds')
 const { baseUri } = require('../../../__env')
 const { logger } = require('../../../context')
 
@@ -41,11 +49,11 @@ exports.post = async ({ appSdk, admin }, req, res) => {
 
     switch (methodCode) {
       case 'credit_card': {
-        // extract encrypted card hash (may come as "ENCRYPTED // BRAND cardnumber")
+        // extract encrypted card hash, may carry brand and 3DS data appended
+        // as "ENCRYPTED // brand last4 // 3DS <id> <amount> <installments>"
         const rawHash = params.credit_card && params.credit_card.hash
-        const encryptedCard = rawHash && rawHash.includes(' // ')
-          ? rawHash.split(' // ')[0]
-          : rawHash
+        const threeds = parseCardHash(rawHash)
+        const encryptedCard = threeds.encryptedCard
 
         if (!encryptedCard) {
           return res.status(400).send({
@@ -57,6 +65,19 @@ exports.post = async ({ appSdk, admin }, req, res) => {
         const installmentsNumber = params.installments_number || 1
         const holderName = params.credit_card && params.credit_card.holder_name
 
+        const threedsMode = (config.credit_card && config.credit_card.threeds) || 'disabled'
+        // PagBank answers 400 when the authenticated amount/installments differ
+        // from the charge, so only send an id that matches this exact charge
+        const useThreeds = threedsMode !== 'disabled' && threeds.id &&
+          matchesCharge(threeds, chargeAmount, installmentsNumber)
+        if (threedsMode !== 'disabled' && threeds.id && !useThreeds) {
+          logger.warn(`PagBank: 3DS id ignored for order #${orderNumber}, does not match charge`, {
+            storeId,
+            authenticated: { amount: threeds.amount, installments: threeds.installments },
+            charge: { amount: chargeAmount, installments: installmentsNumber }
+          })
+        }
+
         const charge = {
           reference_id: String(orderNumber).substr(0, 64),
           description: `Pedido #${orderNumber}`.substr(0, 64),
@@ -67,7 +88,10 @@ exports.post = async ({ appSdk, admin }, req, res) => {
           payment_method: {
             type: 'CREDIT_CARD',
             installments: installmentsNumber,
-            capture: true,
+            // strict stores only capture after PagBank confirms the issuer
+            // authenticated the charge; capturing first and refunding later is
+            // not reliable (PagBank answers refund_temporarily_unavailable)
+            capture: threedsMode !== 'strict',
             card: {
               encrypted: encryptedCard,
               store: false
@@ -82,15 +106,73 @@ exports.post = async ({ appSdk, admin }, req, res) => {
           }
         }
 
-        const { data } = await pagbank.post('/orders', {
-          ...basePayload,
-          charges: [charge]
-        })
+        if (useThreeds) {
+          charge.payment_method.authentication_method = {
+            type: 'THREEDS',
+            id: threeds.id
+          }
+        }
+
+        let data
+        try {
+          const response = await pagbank.post('/orders', {
+            ...basePayload,
+            charges: [charge]
+          })
+          data = response.data
+        } catch (err) {
+          // PagBank rejected the authentication id itself; a permissive store
+          // would rather charge without 3DS than lose the sale
+          if (!useThreeds || threedsMode === 'strict' ||
+            !isInvalidAuthenticationId(err.response && err.response.data)) {
+            throw err
+          }
+          logger.warn(`PagBank: retrying order #${orderNumber} without 3DS`, {
+            storeId,
+            response: err.response && err.response.data
+          })
+          delete charge.payment_method.authentication_method
+          const retry = await pagbank.post('/orders', {
+            ...basePayload,
+            charges: [charge]
+          })
+          data = retry.data
+        }
 
         responseData = data
-        const responseCharge = data.charges && data.charges[0]
+        let responseCharge = data.charges && data.charges[0]
         const chargeId = responseCharge && responseCharge.id
-        const chargeStatus = responseCharge && responseCharge.status
+        let chargeStatus = responseCharge && responseCharge.status
+
+        // the authentication verdict comes from PagBank, never from the client:
+        // the SDK may report NOT_AUTHENTICATED for a charge PagBank authenticates
+        const authentication = parseChargeAuthentication(responseCharge)
+        if (authentication.status) {
+          logger.info(`PagBank: charge ${chargeId} authentication ${authentication.status}`, { storeId, orderNumber })
+        }
+
+        if (threedsMode === 'strict') {
+          // the charge was only pre-authorized; capture it or let it go
+          if (!authentication.authenticated || !chargeId) {
+            if (chargeId && chargeStatus !== 'DECLINED') {
+              await cancelCharge(pagbank, chargeId, chargeAmount, storeId)
+            }
+            return res.status(400).send({
+              error: 'THREEDS_REQUIRED',
+              message: 'Não foi possível autenticar o cartão junto ao emissor, utilize outro cartão ou forma de pagamento'
+            })
+          }
+          const captured = await captureCharge(pagbank, chargeId, chargeAmount, storeId)
+          if (!captured) {
+            await cancelCharge(pagbank, chargeId, chargeAmount, storeId)
+            return res.status(409).send({
+              error: 'CAPTURE_FAILED',
+              message: 'Não foi possível concluir a cobrança, tente novamente'
+            })
+          }
+          responseCharge = captured
+          chargeStatus = captured.status
+        }
 
         // installment value calculation
         const installmentValue = Math.round(chargeAmount / installmentsNumber) / 100

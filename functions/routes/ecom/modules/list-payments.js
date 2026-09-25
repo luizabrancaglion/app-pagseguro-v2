@@ -22,7 +22,7 @@ exports.post = async ({ appSdk, admin }, req, res) => {
   const isSandbox = config.sandbox === true
   const pagbank = createPagbankAxios(pagbankToken, isSandbox)
   const scriptSuffix = isSandbox ? '-sandbox' : ''
-  const scriptUri = `${hostingUri}/pagseguro-dp${scriptSuffix}.js?v=2`
+  const scriptUri = `${hostingUri}/pagseguro-dp${scriptSuffix}.js?v=3`
 
   // https://apx-mods.e-com.plus/api/v1/list_payments/response_schema.json?store_id=100
   const response = {
@@ -71,9 +71,7 @@ exports.post = async ({ appSdk, admin }, req, res) => {
       },
       js_client: {
         script_uri: scriptUri,
-        onload_expression: publicKey
-          ? `window.pagbankPublicKey=${JSON.stringify(publicKey)};`
-          : '',
+        onload_expression: await buildOnloadExpression({ publicKey, ccConfig, pagbank, params, storeId, isSandbox }),
         cc_brand: {
           function: 'pagbankGetBrand',
           is_promise: false
@@ -192,6 +190,39 @@ exports.post = async ({ appSdk, admin }, req, res) => {
   }
 
   res.send(response)
+}
+
+/**
+ * Builds the js_client onload expression: the card public key plus, when the
+ * store enabled 3DS, a freshly minted authentication session.
+ *
+ * The session is only created for an actual checkout (there is an amount to
+ * charge); list_payments is also called from product and cart pages, and minting
+ * a 30-minute session on every page view would be pure waste.
+ */
+const buildOnloadExpression = async ({ publicKey, ccConfig, pagbank, params, storeId, isSandbox }) => {
+  const keyExpression = publicKey ? `window.pagbankPublicKey=${JSON.stringify(publicKey)};` : ''
+  const mode = ccConfig.threeds || 'disabled'
+  const total = params.amount && params.amount.total
+
+  if (mode === 'disabled' || !(total > 0)) {
+    return `${keyExpression}window.pagbankThreeds=null;`
+  }
+
+  const threeds = { mode, env: isSandbox ? 'SANDBOX' : 'PROD', session: null, expires_at: null }
+  try {
+    const { data } = await pagbank.post('/checkout-sdk/sessions')
+    threeds.session = data.session
+    // PagBank returns expires_at in MILLISECONDS
+    threeds.expires_at = data.expires_at || null
+  } catch (err) {
+    logger.warn('PagBank: could not create 3DS session', {
+      storeId,
+      status: err.response && err.response.status,
+      err: err.message
+    })
+  }
+  return `${keyExpression}window.pagbankThreeds=${JSON.stringify(threeds)};`
 }
 
 /**
